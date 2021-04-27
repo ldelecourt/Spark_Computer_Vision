@@ -1,0 +1,163 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ## 1. Streaming d'input permettant de récupérer des photos, détecter les visages, les découper et les extraire dans un nouveau dossier.
+# MAGIC 
+# MAGIC ---
+# MAGIC #### On commence par monter le blob Azure, si besoin.
+
+# COMMAND ----------
+
+import io
+import os
+import numpy as np
+import pandas as pd
+from pyspark.sql.functions import col, pandas_udf, regexp_extract, regexp_replace, split
+from PIL import Image
+import tensorflow as tf
+
+# COMMAND ----------
+
+containerName = "conteneursparkcv"
+storageAccountName = "stockagespark"
+# Attention!! générer la clé SAS depuis la page du "stockagespark" pas depuis la page du conteneur "conteneursparkcv"
+# Il faut générer cette clé à chaque nouvelle connexion
+sas = "?sv=2020-02-10&ss=bfqt&srt=sco&sp=rwdlacupx&se=2021-04-23T14:24:33Z&st=2021-04-23T06:24:33Z&spr=https&sig=3eV%2BaQrxE4M%2FUUmZx8JlwbaNDPdNQCLRXdJ%2F%2BZpr%2Fds%3D"
+url = "wasbs://" + containerName + "@" + storageAccountName + ".blob.core.windows.net"
+config = "fs.azure.sas." + containerName + "." + storageAccountName + ".blob.core.windows.net"
+
+# COMMAND ----------
+
+import os
+dir = "/mnt/data/"
+
+if not os.path.exists(dir):
+  print("On monte le dossier data")
+  dbutils.fs.mount(
+    source = url,
+    mount_point = "/mnt/data",
+    extra_configs = {config:sas})
+else:
+  print("Le dossier data est déjà monté")
+  
+# Si on veut démonter un dossier
+# dbutils.fs.unmount("/mnt/data/")
+
+# COMMAND ----------
+
+# MAGIC %fs ls mnt/data/
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Chargement des images dans un dataframe au format binaire
+
+# COMMAND ----------
+
+schema2 = spark.read.format("binaryFile").load("/mnt/data/Photo/").schema
+# change read to readStream
+images2 = spark.readStream \
+  .format("binaryFile") \
+  .schema(schema2) \
+  .option("maxFilesPerTrigger", "500") \
+  .option("recursiveFileLookup", "true") \
+  .option("pathGlobFilter", "*.png") \
+  .load("/mnt/data/Photo/")
+
+# COMMAND ----------
+
+# MAGIC %md #### Ensuite on crée des fonction permettant de ne choisir qu'une partie des données à mettre dans le dataframe qui sera streamé.
+# MAGIC Ici on utilise que le nom de la photo d'origine, nous connaissons le dossier dans lequel elles doivent être déposé: /mnt/data/Photo/
+
+# COMMAND ----------
+
+def extract_photo_name(path2):
+  """Extract the name of the photo."""
+  return regexp_extract(path2, "(/([\w|\d]*)_x)", 1)
+
+def extract_photo_name1(path1):
+  """Extract the name of the photo."""
+  return regexp_replace(path1, "(^.*/)", "")
+
+def extract_photo_name2(path2):
+  """Extract the name of the photo."""
+  return regexp_replace(path2, "(_.*)\d", "")
+
+# COMMAND ----------
+
+df2 = images2.select(
+  extract_photo_name1(col("path")).alias("photo"),
+  col("content")).withColumn("photo", extract_photo_name2(col("photo"))).drop(col("content"))
+
+# COMMAND ----------
+
+# MAGIC %md ### Fonction qui permet d'extraire les visages dans un nouveau dossier qui sera utiliser pour la détection de masques.
+
+# COMMAND ----------
+
+import cv2
+
+def Extraction_des_visages(nom_photo):
+  chemin_photo = '/dbfs/mnt/data/Photo/' + nom_photo
+  
+  img = cv2.imread(chemin_photo)
+  img = cv2.cvtColor(img, cv2.IMREAD_GRAYSCALE)
+  
+  # loading haarcascade_frontalface_default.xml
+  face_model = cv2.CascadeClassifier('/dbfs/mnt/data/Haarcascades/haarcascade_frontalface_default.xml')
+  faces = face_model.detectMultiScale(img, scaleFactor=1.1, minNeighbors=4) #returns a list of (x,y,w,h) tuples
+  img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+  chemin_sortie_visage = "/dbfs/mnt/data/WithOrWithoutMask/Test/"
+  # Extraction des visages présents sur la photo
+  for i in range(len(faces)):
+    (x,y,w,h) = faces[i]
+    crop = img[y:y+h,x:x+w]
+    chemin_visage = chemin_sortie_visage + nom_photo[:-4] + "_x" + str(x) + "_y" + str(y) + "_w" + str(w) + "_h" + str(h) + ".png"
+    cv2.imwrite(chemin_visage, crop)
+    
+  return str(len(faces))
+
+# COMMAND ----------
+
+# On transforme la fonction précédente en UDF
+Extraction_des_visages_UDF = udf(lambda x: Extraction_des_visages(x))
+
+# COMMAND ----------
+
+# MAGIC %md ### Streaming du dataframe de photos + extraction des visages
+
+# COMMAND ----------
+
+spark.conf.set("spark.sql.streaming.checkpointLocation", "dbfs:/ml/tmp/checkpoint")
+# change write to writeStream
+df2.writeStream \
+  .format("delta") \
+  .outputMode("append") \
+  .table("extraction_visage")
+
+decoupage = df2.withColumn("Nombre de visages extrait", Extraction_des_visages_UDF(col("photo")))
+display(decoupage)
+
+# COMMAND ----------
+
+# MAGIC %md #### On peut visualiser les visages extraits en temps réel
+
+# COMMAND ----------
+
+schema_visages = spark.read.format("image").load("/mnt/data/WithOrWithoutMask/Test/").schema
+# On créé en plus un dataframe avec les images
+visages = spark.readStream \
+  .format("image") \
+  .schema(schema_visages) \
+  .option("pathGlobFilter", "*.png") \
+  .load("/mnt/data/WithOrWithoutMask/Test/")
+
+display(visages)
+
+# COMMAND ----------
+
+# Permet de supprimer le fichier de checkpoint
+#dbutils.fs.rm("dbfs:/ml/tmp/checkpoint/", True)
+
+# COMMAND ----------
+

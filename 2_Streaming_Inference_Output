@@ -1,6 +1,8 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC ## 2. Streaming ETL Images into a Delta Table and Inference prediction on faces already detected
+# MAGIC ## 2. Détection du port du masque sur les visages extraits + création de l'output 
+# MAGIC 
+# MAGIC output = photos originales avec le label et un rectangle de couleur (vert ou rouge) autour des visages précédemment détectés
 # MAGIC 
 # MAGIC ---
 # MAGIC #### On commence par monter le blob Azure, si besoin.
@@ -49,7 +51,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Load images into a DataFrame using binary file data source
+# MAGIC ### Chargement des visages extraits dans un dataframe
 
 # COMMAND ----------
 
@@ -66,7 +68,7 @@ images = spark.readStream \
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ###Expand the DataFrame with extra metadata columns.
+# MAGIC ### On sélectionne différentes données à garder dans ce dataframe
 
 # COMMAND ----------
 
@@ -150,6 +152,10 @@ def recuperation_des_coordonnees(nom_visage):
 
 # COMMAND ----------
 
+# MAGIC %md #### Fonction qui permet de dessiner les labels et les rectangles adéquat en fonction des prédictions. En plus de cela, un système de monitoring par mail a été déployer, si un individu ne porte pas de masque sur une photo, un email est envoyé afin d'avertir l'utilisateur
+
+# COMMAND ----------
+
 import cv2
 import os
 
@@ -209,7 +215,7 @@ Recuperation_des_visages_UDF = udf(lambda x,y,z: Recuperation_des_visages(x,y,z)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ###Save stream into a Delta table sink.
+# MAGIC ### On lance le stream qui va effectuer la prédiction et sauvegarder l'output.
 
 # COMMAND ----------
 

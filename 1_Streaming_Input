@@ -90,7 +90,7 @@ df2 = images2.select(
 
 # COMMAND ----------
 
-# MAGIC %md ### Fonction qui permet d'extraire les visages dans un nouveau dossier qui sera utiliser pour la détection de masques.
+# MAGIC %md ### Fonction qui permet d'extraire les visages dans un nouveau dossier qui sera utilisé pour la détection de masques.
 
 # COMMAND ----------
 

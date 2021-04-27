@@ -1,0 +1,257 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ## 2. Streaming ETL Images into a Delta Table and Inference prediction on faces already detected
+# MAGIC 
+# MAGIC ---
+# MAGIC #### On commence par monter le blob Azure, si besoin.
+
+# COMMAND ----------
+
+import os
+import io
+import numpy as np
+import pandas as pd
+from pyspark.sql.functions import col, pandas_udf, regexp_extract, PandasUDFType, regexp_replace, split, current_timestamp
+from PIL import Image
+import tensorflow as tf
+
+# COMMAND ----------
+
+containerName = "conteneursparkcv"
+storageAccountName = "stockagespark"
+# Attention!! générer la clé SAS depuis la page du "stockagespark" pas depuis la page du conteneur "conteneursparkcv"
+# Il faut générer cette clé à chaque nouvelle connexion
+sas = "?sv=2020-02-10&ss=bfqt&srt=sco&sp=rwdlacupx&se=2021-04-12T15:57:31Z&st=2021-04-12T07:57:31Z&spr=https&sig=b8JK14HIhGgqMbKJL0gI79PtsBc0jg%2B6nQAhakTTags%3D"
+url = "wasbs://" + containerName + "@" + storageAccountName + ".blob.core.windows.net"
+config = "fs.azure.sas." + containerName + "." + storageAccountName + ".blob.core.windows.net"
+
+# COMMAND ----------
+
+import os
+dir = "/mnt/data/"
+
+if not os.path.exists(dir):
+  print("On monte le dossier data")
+  dbutils.fs.mount(
+    source = url,
+    mount_point = "/mnt/data",
+    extra_configs = {config:sas})
+else:
+  print("Le dossier data est déjà monté")
+  
+# Si on veut démonter un dossier
+# dbutils.fs.unmount("/mnt/data/")
+
+# COMMAND ----------
+
+# MAGIC %fs ls mnt/data/
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Load images into a DataFrame using binary file data source
+
+# COMMAND ----------
+
+schema = spark.read.format("binaryFile").load("/mnt/data/WithOrWithoutMask/").schema
+# change read to readStream
+images = spark.readStream \
+  .format("binaryFile") \
+  .schema(schema) \
+  .option("maxFilesPerTrigger", "500") \
+  .option("recursiveFileLookup", "true") \
+  .option("pathGlobFilter", "*.png") \
+  .load("/mnt/data/WithOrWithoutMask/")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Expand the DataFrame with extra metadata columns.
+
+# COMMAND ----------
+
+def extract_label(path_col):
+  """Extract label from file path using built-in SQL functions."""
+  return regexp_extract(path_col, "/mnt/data/WithOrWithoutMask/([^/]+)", 1)
+
+# COMMAND ----------
+
+def extract_photo_name(path2):
+  """Extract the name of the photo."""
+  return regexp_extract(path2, "(/([\w|\d]*)_x)", 1)
+
+# COMMAND ----------
+
+def extract_photo_name1(path1):
+  """Extract the name of the photo."""
+  return regexp_replace(path1, "(^.*/)", "")
+
+def extract_photo_name2(path2):
+  """Extract the name of the photo."""
+  return regexp_replace(path2, "(_.*)\d", "")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC A pandas user-defined function (UDF), also known as vectorized UDF, is a user-defined function that uses Apache Arrow to transfer data and pandas to work with the data.
+
+# COMMAND ----------
+
+df = images.select(
+  col("path"),
+  extract_photo_name1(col("path")).alias("photo"),
+  col("modificationTime"),
+  extract_label(col("path")).alias("label"),
+  col("content")).withColumn("photo", extract_photo_name2(col("photo")))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Fonction pour la prédiction
+
+# COMMAND ----------
+
+keras_model = tf.keras.models.load_model('/dbfs/mnt/data/Modele/masknet.h5')
+bc_model_weights = sc.broadcast(keras_model.get_weights())
+
+# COMMAND ----------
+
+@pandas_udf("class: string, score: float", PandasUDFType.SCALAR_ITER)
+def prediction_keras(content_series_iter):
+  model = tf.keras.models.load_model('/dbfs/mnt/data/Modele/masknet.h5')
+  model.set_weights(bc_model_weights.value)
+  for content_iter in content_series_iter:
+    for img_bytes in content_iter:
+      img = Image.open(io.BytesIO(img_bytes))
+      img = img.convert('RGB')
+      img = img.resize((128,128), Image.NEAREST)
+#       img = Image.img_to_array(img)
+#       image = tf.keras.preprocessing.image.load_img(image, grayscale=False, color_mode="rgb", target_size=(128,128), interpolation="nearest")
+      image = tf.keras.preprocessing.image.img_to_array(img)
+      batch = np.array([image])  # Convert single image to a batch.
+      score = model.predict(batch)
+      if np.argmax(score) == 0:
+        res = "MASK"
+      else:
+        res = "NO MASK"
+      liste = [(res, max(max(score)))]
+      yield pd.DataFrame(liste)
+
+# COMMAND ----------
+
+# Fonction qui permet de récupérer les coordonnées des visages
+# à partir du nom des visages dans le dataframe streamé
+def recuperation_des_coordonnees(nom_visage):
+  x = nom_visage.split("_")[1][1:]
+  y = nom_visage.split("_")[2][1:]
+  w = nom_visage.split("_")[3][1:]
+  h = nom_visage.split("_")[4][1:].split('.')[0]
+  return (int(x), int(y), int(w), int(h))
+
+# COMMAND ----------
+
+import cv2
+import os
+
+def Recuperation_des_visages(chemin_visage, nom_photo, df_label):
+  # On regarde si la photo a déjà été traité et existe dans le dossier de sortie
+  nom_sortie = '/dbfs/mnt/data/Sortie/' + nom_photo
+  if os.path.isfile(nom_sortie):
+    # Lecture de la photo d'origine qui se trouve en sortie
+    photo_original = cv2.imread(nom_sortie)
+  else:
+    # Récupération du chemin de la photo d'origine
+    nom_photo_original = '/dbfs/mnt/data/Photo/' + nom_photo
+    photo_original = cv2.imread(nom_photo_original)
+
+
+  # Label du visage
+  mask_label = df_label["class"]
+  # On dessine le rectangle et le label du 1er visage:
+  (x,y,w,h) = recuperation_des_coordonnees(chemin_visage)
+  
+  # Création des couleurs en fonction du label
+  mask_label_color = {"MASK":(0,255,0), "NO MASK":(0,0,255)}
+  
+  # On met le text dans la photo d'origine
+  photo_original = cv2.putText(photo_original, mask_label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mask_label_color[mask_label], 2)
+  # On met les rectangles dans la photo d'origine
+  photo_original = cv2.rectangle(photo_original, (x,y), (x+w,y+h), mask_label_color[mask_label], 1)
+
+  # On sauve l'image dans le dossier de sortie
+  cv2.imwrite(nom_sortie, photo_original)
+  
+  # Si un individu ne porte pas de masque on envoie un mail
+  if mask_label == "NO MASK":
+    # Petit morceau de code pour initialiser la connexion au serveur de mail
+    server = smtplib.SMTP('smtp.gmail.com:587')
+    server.ehlo()
+    server.starttls()
+    server.login("aqwzsxtestaqwzsx@gmail.com", "XXX")
+    sender = "aqwzsxtestaqwzsx@gmail.com"
+    recipient = "XXX@XXX.com"
+    # On rajoute un morceau de code qui va envoyer un mail si le label NO MASK est détecté dans l'image analysée
+    msg = MIMEMultipart()
+    msg['Subject'] = 'Alert NO MASK Detected!!!   ' + nom_photo
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg.attach(MIMEText('Une personne sans masque a été détecté sur la photo: ' + nom_photo ))
+    server.sendmail(sender, [recipient], msg.as_string())
+  
+  # On return quelque chose à mettre dans la nouvelle colonne sinon ça marche pas (trouver une méthode plus opit)
+  retour = mask_label
+  return retour
+
+# COMMAND ----------
+
+Recuperation_des_visages_UDF = udf(lambda x,y,z: Recuperation_des_visages(x,y,z))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Save stream into a Delta table sink.
+
+# COMMAND ----------
+
+spark.conf.set("spark.sql.parquet.compression.codec", "uncompressed")
+spark.conf.set("spark.sql.streaming.checkpointLocation", "dbfs:/ml/tmp/checkpoint")
+
+# Librairies pour pouvoir envoyer un email
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+
+# change write to writeStream
+df.writeStream \
+  .format("delta") \
+  .outputMode("append") \
+  .table("maskdetection_content2")
+
+
+predictions = df.withColumn("prediction", prediction_keras(col("content"))).withColumn("Label", Recuperation_des_visages_UDF(col("path"), col("photo"), col("prediction"))).drop('content')
+display(predictions.select('path', 'photo', 'Label'))
+
+# COMMAND ----------
+
+# MAGIC %md #### Ici on peut voir les images finales traitées en temps réel ...
+
+# COMMAND ----------
+
+schema_final = spark.read.format("image").load("/mnt/data/Sortie/").schema
+# On créé en plus un dataframe avec les images
+photo_traitee = spark.readStream \
+  .format("image") \
+  .schema(schema_final) \
+  .option("pathGlobFilter", "*.png") \
+  .load("/mnt/data/Sortie/") 
+
+display(photo_traitee)
+
+# COMMAND ----------
+
+# Permet de supprimer le fichier de checkpoint
+#dbutils.fs.rm("dbfs:/ml/tmp/checkpoint/", True)
+
+# COMMAND ----------
+
